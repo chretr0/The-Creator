@@ -1,0 +1,16 @@
+title = "New Worlds secret scanning"
+
+[extend]
+useDefault = true
+
+# These exact JSON field identifiers are not API keys. Do not exclude any file paths:
+# all other strings in the catalogues must remain eligible for credential detection.
+[[allowlists]]
+description = "Moon greenhouse parameter identifiers"
+regexTarget = "secret"
+regexes = ['''^(foodKgPerM2Day|oxygenKgPerM2Day)$''']
+
+[[allowlists]]
+description = "Aqueduct water-stress field identifiers"
+regexTarget = "secret"
+regexes = ['''^bws(2030|2050|2080)(Bau|Opt)Label$''']

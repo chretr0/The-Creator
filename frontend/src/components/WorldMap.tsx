@@ -1,0 +1,885 @@
+import { useEffect, useRef, useState, type DragEvent } from "react";
+import { maplibregl } from "../lib/maplibre";
+import { MapboxOverlay } from "@deck.gl/mapbox";
+import { H3HexagonLayer } from "@deck.gl/geo-layers";
+import { impactColour, timeLabel, type ImpactCell, type TimelineOverlay } from "../lib/timeline";
+import { GeoJsonLayer, LineLayer, ScatterplotLayer, TextLayer } from "@deck.gl/layers";
+import { WebMercatorViewport, type Layer, type PickingInfo } from "@deck.gl/core";
+import { getResolution, gridDiskDistances, latLngToCell } from "h3-js";
+import type { Project } from "../lib/api";
+import { normaliseLongitude, viewportCells, type HexOutlines, type ViewportCells } from "../lib/h3grid";
+import { typeColour, typeLabel } from "../lib/projectTypes";
+import { PRESET_DRAG_TYPE, STATE_COLOUR, STATE_LABEL, type CellState } from "../lib/buildings";
+import { facilityMetric, facilityTitle, formatKv, formatKw, LAYER_META, type Facility } from "../lib/infrastructure";
+import { applyBasemapTheme } from "../lib/mapTheme";
+import type { Theme } from "../lib/theme";
+import type { Body } from "../bodies";
+import { metresPerPixel, scaleBar } from "../lib/bodyGeometry";
+import { isBackgroundLayer } from "../lib/mapPicking";
+
+type RGB = [number, number, number];
+
+// Display-only marker height for facility "stems" in the tilted view (as in gods-eye-view). Not data.
+// Capped to about STEM_MAX_PX on screen so the tips stay in view when zoomed in to street level.
+const STEM_HEIGHT_M = 1500;
+const STEM_MAX_PX = 70;
+
+function stemHeightM(map: maplibregl.Map, tilted: boolean, radiusKm: number): number {
+  if (!tilted) return 0;
+  const metresPerPx = metresPerPixel(map.getCenter().lat, map.getZoom(), radiusKm);
+  return Math.min(STEM_HEIGHT_M, STEM_MAX_PX * metresPerPx);
+}
+// Hexagon borders are drawn only near the cursor: this many rings around the hovered cell,
+// fading out with distance.
+const PROXIMITY_RINGS = 3;
+type ProximityCell = { h3: string; ring: number };
+
+function proximityCells(centre: string | null): ProximityCell[] {
+  if (!centre) return [];
+  return gridDiskDistances(centre, PROXIMITY_RINGS).flatMap((ring, i) => ring.map((h3) => ({ h3, ring: i })));
+}
+
+// Facility labels appear from this zoom and are thinned by a screen-space grid budget, the same
+// approach as gods-eye-view (one label per grid cell, highest priority wins, capped total).
+const LABEL_MIN_ZOOM = 5;
+const LABEL_CELL_PX: [number, number] = [130, 30];
+const LABEL_MAX = 400;
+
+function pickLabels(map: maplibregl.Map, facilities: Facility[], selectedId: string | null, z: number): Facility[] {
+  if (map.getZoom() < LABEL_MIN_ZOOM) return [];
+  const { clientWidth: w, clientHeight: h } = map.getCanvas();
+  // Project where deck.gl will actually draw the label (at the stem tip when tilted).
+  const centre = map.getCenter();
+  const viewport = new WebMercatorViewport({
+    width: w,
+    height: h,
+    longitude: centre.lng,
+    latitude: centre.lat,
+    zoom: map.getZoom(),
+    pitch: map.getPitch(),
+    bearing: map.getBearing(),
+  });
+  // Power plants are dense (thousands of small solar and landfill-gas sites), so only bigger ones
+  // are labelled until zoomed in.
+  const zoom = map.getZoom();
+  const minPlantMw = zoom >= 11 ? 0 : zoom >= 9 ? 20 : 200;
+  const best = new Map<string, { f: Facility; score: number }>();
+  for (const f of facilities) {
+    const { lon, lat, name, operator, companyFacilityCount, layer, capacityMw } = f.properties;
+    if (f.id !== selectedId) {
+      if ((!name && !operator) || LAYER_META[layer].line) continue;
+      if (layer === "power_plants" && (capacityMw ?? 0) < minPlantMw) continue;
+    }
+    const [x, y] = viewport.project([lon, lat, z]);
+    if (!(x >= -20 && y >= -20 && x <= w + 20 && y <= h + 20)) continue;
+    const score = f.id === selectedId ? Infinity : (name ? 1e6 : 0) + (companyFacilityCount ?? 0) + (capacityMw ?? 0);
+    const key = `${Math.floor(x / LABEL_CELL_PX[0])}:${Math.floor(y / LABEL_CELL_PX[1])}`;
+    const cur = best.get(key);
+    if (!cur || score > cur.score) best.set(key, { f, score });
+  }
+  return [...best.values()]
+    .sort((a, b) => b.score - a.score)
+    .slice(0, LABEL_MAX)
+    .map((x) => x.f);
+}
+
+/**
+ * Metric scale bar for bodies other than Earth. MapLibre's ScaleControl measures with Earth's radius
+ * (3.67× too long on the Moon), so this one uses the body's. Same element and class as
+ * ScaleControl, so it shares its styling. Bodies without tilt stay at pitch 0, where the centre
+ * latitude's Web Mercator scale is exact.
+ */
+class BodyScaleControl implements maplibregl.IControl {
+  private readonly radiusKm: number;
+  private readonly maxWidthPx: number;
+  private map: maplibregl.Map | undefined;
+  private container: HTMLDivElement | undefined;
+
+  constructor(radiusKm: number, maxWidthPx = 100) {
+    this.radiusKm = radiusKm;
+    this.maxWidthPx = maxWidthPx;
+  }
+
+  private readonly update = () => {
+    const { map, container } = this;
+    if (!map || !container) return;
+    const { widthPx, label } = scaleBar(metresPerPixel(map.getCenter().lat, map.getZoom(), this.radiusKm), this.maxWidthPx);
+    container.style.width = `${widthPx}px`;
+    if (container.textContent !== label) container.textContent = label;
+  };
+
+  onAdd(map: maplibregl.Map) {
+    this.map = map;
+    this.container = document.createElement("div");
+    this.container.className = "maplibregl-ctrl maplibregl-ctrl-scale body-scale";
+    map.on("move", this.update);
+    this.update();
+    return this.container;
+  }
+
+  onRemove() {
+    this.map?.off("move", this.update);
+    this.container?.remove();
+    this.map = undefined;
+    this.container = undefined;
+  }
+}
+
+export type MapFocus = {
+  latitude: number;
+  longitude: number;
+  zoom?: number;
+  /** [west, south, east, north]; when set the map fits it instead of flying to a zoom. */
+  bbox?: [number, number, number, number];
+  nonce: number;
+};
+
+export type Picked = { layerId: string; object: unknown };
+
+export type MapView = {
+  bounds: { west: number; south: number; east: number; north: number };
+  zoom: number;
+  centre: { lat: number; lon: number };
+};
+
+export type RasterImagery = {
+  key: string;
+  tiles: string[];
+  maxzoom: number;
+  opacity: number;
+  attribution: string;
+};
+
+const IMAGERY_SOURCE = "context-imagery";
+const SCENE_SOURCE = "scene-image";
+/** Source and layer id prefix for `rasterOverlays` (`overlay-<key>`). */
+const OVERLAY_PREFIX = "overlay-";
+
+/** The basemap's first label or 3D building layer: rasters go beneath it. */
+function labelAnchor(map: maplibregl.Map): string | undefined {
+  return map.getStyle().layers.find((l) => l.type === "symbol" || l.type === "fill-extrusion")?.id;
+}
+
+/** Imagery and scenes go beneath any raster overlays (and so beneath the labels too). */
+function imageryAnchor(map: maplibregl.Map): string | undefined {
+  return map.getLayersOrder().find((id) => id.startsWith(OVERLAY_PREFIX)) ?? labelAnchor(map);
+}
+
+export type SceneImage = { id: string; url: string; bounds: [number, number, number, number] };
+
+type Props = {
+  /** The body being mapped: basemap, starting view, zoom limit, theming, tilt and scale bar. Fixed for the map's lifetime. */
+  body: Body;
+  theme: Theme;
+  /** Hexagon borders everywhere, only near the cursor, or off; fills, markers and picking are unaffected. */
+  hexOutlines: HexOutlines;
+  projects: Project[];
+  selectedProjectId: string | null;
+  selectedCell: string | null;
+  crosshair: boolean;
+  focus: MapFocus | null;
+  facilities: Facility[];
+  facilityColour: (f: Facility) => RGB;
+  selectedFacilityId: string | null;
+  tilted: boolean;
+  /** Context deck.gl layers (boundaries, cables, hazards, power), drawn above the grid. */
+  contextLayers: Layer[];
+  /**
+   * Further layer ids that only shade the ground, like the grid: a click on one picks a record within
+   * a few pixels instead, and reports nothing picked when there is none.
+   */
+  backgroundLayerIds?: string[];
+  timeline?: TimelineOverlay | null;
+  contextTooltip: (layerId: string, object: unknown) => string | null;
+  imagery: RasterImagery | null;
+  /**
+   * Extra raster layers (e.g. WMS overlays), above the basemap and `imagery`, below the labels; later
+   * entries draw on top. Keyed by `key`: an opacity change updates the layer in place.
+   */
+  rasterOverlays?: RasterImagery[];
+  onViewChange: (view: MapView) => void;
+  onMapClick: (latitude: number, longitude: number, picked: Picked | null) => void;
+  onGridChange: (grid: { resolution: number; count: number; overview: boolean; cells: string[] }) => void;
+  /** Choropleth fill for display cells (null = neutral "no layer" styling). */
+  cellFill: ((h3: string) => [number, number, number, number]) | null;
+  cellTooltip: (h3: string) => string | null;
+  /** A prepared single-scene PNG (EPSG:4326) drawn at its bounds, under the labels. */
+  scene: SceneImage | null;
+  /** Building-assessment screening states for resolution-6 cells, drawn under project markers. */
+  assessmentCells?: CellState[] | null;
+  /**
+   * How to draw the screening cells (default: by hard state). `key` changes whenever the colouring does,
+   * e.g. when the map is coloured by one suitability factor instead of the overall grade.
+   */
+  assessmentStyle?: {
+    key: string;
+    fill: (c: CellState) => [number, number, number, number];
+    line: (c: CellState) => [number, number, number, number];
+    tooltip: (c: CellState) => string;
+  } | null;
+  /** Ghost marker for a building placement preview (not its physical footprint). */
+  preview?: { latitude: number; longitude: number; colour?: RGB } | null;
+  /** A real example building dragged from the Build tab and dropped at this point. */
+  onDropPreset?: (presetId: string, latitude: number, longitude: number) => void;
+};
+
+const isPresetDrag = (e: DragEvent) => Array.from(e.dataTransfer.types).includes(PRESET_DRAG_TYPE);
+
+export default function WorldMap(props: Props) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const mapRef = useRef<maplibregl.Map | null>(null);
+  const projectMarkers = useRef(new Map<string, maplibregl.Marker>());
+  const overlayRef = useRef<MapboxOverlay | null>(null);
+  const basemapRef = useRef<maplibregl.LayerSpecification[]>([]);
+  const [grid, setGrid] = useState<ViewportCells>({ resolution: 0, cells: [], overview: true });
+  const [labelled, setLabelled] = useState<Facility[]>([]);
+  const [stemM, setStemM] = useState(0);
+  const [dropping, setDropping] = useState(false);
+  const [hoverCell, setHoverCell] = useState<string | null>(null);
+  /** True once the style has loaded and sources/layers can be added. */
+  const [styleReady, setStyleReady] = useState(false);
+  /** Tile spec of each applied raster overlay, to re-create its source only when the tiles change. */
+  const overlaySpecs = useRef(new Map<string, string>());
+  const gridResolution = useRef(0);
+  const cursor = useRef<{ lat: number; lng: number } | null>(null);
+  gridResolution.current = grid.resolution;
+
+  // Keep latest callbacks without re-creating the map.
+  const propsRef = useRef(props);
+  propsRef.current = props;
+
+  useEffect(() => {
+    const { body } = propsRef.current;
+    const map = new maplibregl.Map({
+      container: containerRef.current!,
+      style: body.style,
+      center: body.initialView.center,
+      zoom: body.initialView.zoom,
+      maxZoom: body.maxZoom,
+      // Without tilt the map stays flat (no touch-pitch either), which the body scale bar relies on.
+      ...(body.tilt ? {} : { maxPitch: 0 }),
+      attributionControl: false,
+      dragRotate: false,
+      pitchWithRotate: false,
+    });
+    map.touchZoomRotate.disableRotation();
+    map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-right");
+    map.addControl(
+      body.id === "earth" ? new maplibregl.ScaleControl({ unit: "metric" }) : new BodyScaleControl(body.radiusKm),
+      "bottom-left",
+    );
+
+    const overlay = new MapboxOverlay({ interleaved: false, layers: [] });
+    map.addControl(overlay);
+    mapRef.current = map;
+    overlayRef.current = overlay;
+
+    // Debounced on moveend; a timer (not rAF) so it also runs in background tabs.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const refreshGrid = () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        const b = map.getBounds();
+        const next = viewportCells({
+          west: b.getWest(),
+          east: b.getEast(),
+          south: b.getSouth(),
+          north: b.getNorth(),
+        });
+        setGrid(next);
+        const cur = propsRef.current;
+        const stem = stemHeightM(map, cur.tilted, cur.body.radiusKm);
+        setStemM(stem);
+        setLabelled(pickLabels(map, cur.facilities, cur.selectedFacilityId, stem));
+        propsRef.current.onGridChange({
+          resolution: next.resolution,
+          count: next.cells.length,
+          overview: next.overview,
+          cells: next.cells,
+        });
+        const c = map.getCenter();
+        propsRef.current.onViewChange({
+          bounds: { west: b.getWest(), east: b.getEast(), south: b.getSouth(), north: b.getNorth() },
+          zoom: map.getZoom(),
+          centre: { lat: c.lat, lon: c.lng },
+        });
+      }, 60);
+    };
+    map.on("load", refreshGrid);
+    map.on("load", () => {
+      basemapRef.current = structuredClone(map.getStyle().layers);
+      if (body.themedBasemap) applyBasemapTheme(map, basemapRef.current, propsRef.current.theme);
+      setStyleReady(true);
+    });
+    map.on("moveend", refreshGrid);
+    // Track the display cell under the cursor; state only changes when it moves to another cell.
+    const trackHover = (e: maplibregl.MapMouseEvent) => {
+      const { lat, lng } = e.lngLat;
+      if (!(lat >= -90 && lat <= 90)) return;
+      cursor.current = { lat, lng: normaliseLongitude(lng) };
+      const cell = latLngToCell(lat, normaliseLongitude(lng), gridResolution.current);
+      setHoverCell((prev) => (prev === cell ? prev : cell));
+    };
+    const clearHover = () => {
+      cursor.current = null;
+      setHoverCell(null);
+    };
+    map.on("mousemove", trackHover);
+    map.on("mouseout", clearHover);
+    // The inspector and workspace panels resize the canvas without a window resize.
+    const resize = new ResizeObserver(() => map.resize());
+    resize.observe(containerRef.current!);
+
+    return () => {
+      resize.disconnect();
+      clearTimeout(timer);
+      projectMarkers.current.forEach((marker) => marker.remove());
+      projectMarkers.current.clear();
+      map.remove();
+      mapRef.current = null;
+      overlayRef.current = null;
+      basemapRef.current = [];
+      overlaySpecs.current.clear();
+      setStyleReady(false);
+    };
+    // The body is fixed for a mounted map (the app shell remounts per body).
+  }, []);
+
+  // Buildings live above the GPU data overlays. Pollutant changes never replace their markers.
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    const ids = new Set(props.projects.map((p) => p.id));
+    for (const [id, marker] of projectMarkers.current) if (!ids.has(id)) { marker.remove(); projectMarkers.current.delete(id); }
+    for (const project of props.projects) {
+      let marker = projectMarkers.current.get(project.id);
+      if (!marker) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "project-map-marker";
+        button.addEventListener("click", (event) => {
+          event.stopPropagation();
+          const current = propsRef.current.projects.find((p) => p.id === project.id);
+          if (current) propsRef.current.onMapClick(current.latitude, current.longitude, { layerId: "projects", object: current });
+        });
+        marker = new maplibregl.Marker({ element: button, anchor: "center", pitchAlignment: "viewport" }).setLngLat([project.longitude, project.latitude]).addTo(map);
+        projectMarkers.current.set(project.id, marker);
+      }
+      marker.setLngLat([project.longitude, project.latitude]);
+      const element = marker.getElement();
+      element.setAttribute("aria-label", `Select building ${project.name || typeLabel(project.type)}`);
+      element.setAttribute("aria-pressed", String(project.id === props.selectedProjectId));
+      element.title = `${project.name || typeLabel(project.type)} · ${typeLabel(project.type)}`;
+      element.style.setProperty("--marker-colour", `rgb(${typeColour(project.type).join(",")})`);
+    }
+  }, [props.projects, props.selectedProjectId]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (map && props.body.themedBasemap && basemapRef.current.length) applyBasemapTheme(map, basemapRef.current, props.theme);
+  }, [props.theme, props.body.themedBasemap]);
+
+  useEffect(() => {
+    const canvas = mapRef.current?.getCanvas();
+    if (canvas) canvas.style.cursor = props.crosshair ? "crosshair" : "";
+  }, [props.crosshair]);
+
+  // Tilted view: oblique camera with rotation. The basemap's own building-3d layer (OpenFreeMap,
+// zoom >= 14) supplies building volumes; it is always on and only reads as 3D once tilted.
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !props.body.tilt) return;
+    if (props.tilted) {
+      map.dragRotate.enable();
+      map.touchZoomRotate.enableRotation();
+      map.easeTo({ pitch: 55, duration: 800 });
+    } else {
+      map.dragRotate.disable();
+      map.touchZoomRotate.disableRotation();
+      map.easeTo({ pitch: 0, bearing: 0, duration: 800 });
+    }
+  }, [props.tilted, props.body.tilt]);
+
+  // Re-pick labels when the facility set or selection changes (camera moves are handled on moveend).
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    const stem = stemHeightM(map, props.tilted, props.body.radiusKm);
+    setStemM(stem);
+    setLabelled(pickLabels(map, props.facilities, props.selectedFacilityId, stem));
+  }, [props.facilities, props.selectedFacilityId, props.tilted, props.body.radiusKm]);
+
+  useEffect(() => {
+    const f = props.focus;
+    if (!f || !mapRef.current) return;
+    if (f.bbox) {
+      const [w, s, e, n] = f.bbox;
+      mapRef.current.fitBounds(
+        [
+          [w, s],
+          [e, n],
+        ],
+        { padding: 40, maxZoom: f.zoom ?? 12, speed: 1.6 },
+      );
+      return;
+    }
+    mapRef.current.flyTo({
+      center: [f.longitude, f.latitude],
+      zoom: Math.max(mapRef.current.getZoom(), f.zoom ?? 9),
+      speed: 1.6,
+    });
+  }, [props.focus]);
+
+  // Satellite imagery as a MapLibre raster source, beneath the basemap's labels and buildings.
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    const img = props.imagery;
+    const apply = () => {
+      if (map.getLayer(IMAGERY_SOURCE)) map.removeLayer(IMAGERY_SOURCE);
+      if (map.getSource(IMAGERY_SOURCE)) map.removeSource(IMAGERY_SOURCE);
+      if (!img) return;
+      map.addSource(IMAGERY_SOURCE, {
+        type: "raster",
+        tiles: img.tiles,
+        tileSize: 256,
+        maxzoom: img.maxzoom,
+        attribution: img.attribution,
+      });
+      map.addLayer(
+        { id: IMAGERY_SOURCE, type: "raster", source: IMAGERY_SOURCE, paint: { "raster-opacity": img.opacity } },
+        imageryAnchor(map),
+      );
+    };
+    if (map.isStyleLoaded()) apply();
+    else map.once("load", apply);
+    return () => {
+      map.off("load", apply);
+    };
+    // Opacity changes are handled below without re-creating the source.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [props.imagery?.key]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    const sc = props.scene;
+    const apply = () => {
+      if (map.getLayer(SCENE_SOURCE)) map.removeLayer(SCENE_SOURCE);
+      if (map.getSource(SCENE_SOURCE)) map.removeSource(SCENE_SOURCE);
+      if (!sc) return;
+      const [w, s, e, n] = sc.bounds;
+      map.addSource(SCENE_SOURCE, {
+        type: "image",
+        url: sc.url,
+        coordinates: [
+          [w, n],
+          [e, n],
+          [e, s],
+          [w, s],
+        ],
+      });
+      map.addLayer({ id: SCENE_SOURCE, type: "raster", source: SCENE_SOURCE, paint: { "raster-opacity": 1 } }, imageryAnchor(map));
+    };
+    if (map.isStyleLoaded()) apply();
+    else map.once("load", apply);
+    return () => {
+      map.off("load", apply);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [props.scene?.id]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (map?.getLayer(IMAGERY_SOURCE) && props.imagery) {
+      map.setPaintProperty(IMAGERY_SOURCE, "raster-opacity", props.imagery.opacity);
+    }
+  }, [props.imagery?.opacity, props.imagery]);
+
+  // Raster overlays: add/remove by key, opacity in place, sources re-created only when their tiles change.
+  // Applied once the style has loaded (MapLibre rejects sources before that).
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !styleReady) return;
+    const wanted = props.rasterOverlays ?? [];
+    const specs = overlaySpecs.current;
+    if (!wanted.length && !specs.size) return;
+    const ids = wanted.map((o) => OVERLAY_PREFIX + o.key);
+    const keep = new Set(ids);
+    const drop = (id: string) => {
+      if (map.getLayer(id)) map.removeLayer(id);
+      if (map.getSource(id)) map.removeSource(id);
+      specs.delete(id);
+    };
+    for (const id of [...specs.keys()]) if (!keep.has(id)) drop(id);
+    const anchor = labelAnchor(map);
+    wanted.forEach((o, i) => {
+      const id = ids[i];
+      const spec = JSON.stringify([o.tiles, o.maxzoom, o.attribution]);
+      if (specs.has(id) && specs.get(id) !== spec) drop(id);
+      if (!map.getSource(id)) {
+        map.addSource(id, { type: "raster", tiles: o.tiles, tileSize: 256, maxzoom: o.maxzoom, attribution: o.attribution });
+        specs.set(id, spec);
+      }
+      if (!map.getLayer(id)) {
+        map.addLayer({ id, type: "raster", source: id, paint: { "raster-opacity": o.opacity } }, anchor);
+      } else if (map.getPaintProperty(id, "raster-opacity") !== o.opacity) {
+        map.setPaintProperty(id, "raster-opacity", o.opacity);
+      }
+    });
+    // Keep the drawing order equal to the array order (each moved just beneath the labels, in turn).
+    const order = map.getLayersOrder().filter((id) => id.startsWith(OVERLAY_PREFIX));
+    if (order.join() !== ids.join()) for (const id of ids) map.moveLayer(id, anchor);
+  }, [props.rasterOverlays, styleReady]);
+
+  useEffect(() => {
+    const overlay = overlayRef.current;
+    if (!overlay) return;
+    const { projects, selectedCell, facilities, facilityColour, selectedFacilityId, tilted } = props;
+    // Polygons (OSM footprints) and lines (the high-voltage grid) draw as shapes; everything except
+    // lines also gets a dot, so small sites stay visible at world zoom.
+    const footprints = facilities.filter((f) => f.geometry.type !== "Point");
+    const points = facilities.filter((f) => !LAYER_META[f.properties.layer].line);
+    const tip = tilted ? stemM : 0;
+    const colourTrigger = [facilities, facilityColour];
+    const dark = props.theme === "dark";
+    const selectionLine: [number, number, number, number] = dark ? [150, 192, 255, 255] : [15, 23, 42, 255];
+    const proximityRgb: RGB = props.cellFill ? (dark ? [148, 163, 184] : [51, 65, 85]) : dark ? [140, 172, 214] : [70, 98, 136];
+    const proximityAlpha = dark ? 150 : 130;
+    // After a zoom changes the display resolution, re-resolve the cursor's cell at the new one.
+    const pos = cursor.current;
+    const centre =
+      hoverCell && getResolution(hoverCell) !== grid.resolution && pos
+        ? latLngToCell(pos.lat, pos.lng, grid.resolution)
+        : hoverCell;
+    const nearCursor = props.hexOutlines === "near" ? proximityCells(centre) : [];
+    // Overlay outlines (timeline, assessment, buildings, selection) carry meaning: hidden only when off.
+    const overlayOutlines = props.hexOutlines !== "off";
+
+    const layers = [
+      new H3HexagonLayer<string>({
+        id: "grid",
+        data: grid.cells,
+        getHexagon: (d) => d,
+        filled: true,
+        // In "near" mode borders are drawn by "grid-proximity" around the cursor instead.
+        stroked: props.hexOutlines === "all",
+        extruded: false,
+        highPrecision: true,
+        // Neutral "no data" styling unless a baseline layer is active.
+        getFillColor: props.cellFill ?? [89, 125, 175, 6],
+        getLineColor: props.cellFill ? [51, 65, 85, 30] : dark ? [119, 151, 194, 25] : [86, 114, 151, 42],
+        updateTriggers: { getFillColor: props.cellFill, getLineColor: [!!props.cellFill, dark] },
+        lineWidthUnits: "pixels",
+        getLineWidth: 1,
+        pickable: true,
+        autoHighlight: true,
+        highlightColor: [59, 130, 246, 60],
+      }),
+      new H3HexagonLayer<ProximityCell>({
+        id: "grid-proximity",
+        data: nearCursor,
+        getHexagon: (c) => c.h3,
+        filled: false,
+        stroked: true,
+        extruded: false,
+        highPrecision: true,
+        getLineColor: (c) => [...proximityRgb, Math.round(proximityAlpha * (1 - c.ring / (PROXIMITY_RINGS + 1)))],
+        updateTriggers: { getLineColor: [proximityRgb.join(), proximityAlpha] },
+        lineWidthUnits: "pixels",
+        getLineWidth: 1,
+      }),
+      ...props.contextLayers,
+      new H3HexagonLayer<ImpactCell>({
+        id: "timeline-impact",
+        data: props.timeline?.cells.filter((c) => c.relevant !== false) ?? [],
+        getHexagon: (c) => c.h3Id,
+        getFillColor: (c) => impactColour(c.value, props.timeline?.max ?? 1),
+        stroked: overlayOutlines,
+        getLineColor: [80, 115, 150, 90],
+        lineWidthMinPixels: 0.5,
+        pickable: true,
+        highPrecision: true,
+        updateTriggers: { getFillColor: props.timeline },
+      }),
+      new H3HexagonLayer<CellState>({
+        id: "assessment-cells",
+        data: props.assessmentCells ?? [],
+        getHexagon: (c) => c.h3Id,
+        filled: true,
+        stroked: overlayOutlines,
+        extruded: false,
+        highPrecision: true,
+        getFillColor: props.assessmentStyle?.fill ?? ((c) => [...STATE_COLOUR[c.state], 110]),
+        getLineColor: props.assessmentStyle?.line ?? ((c) => [...STATE_COLOUR[c.state], 200]),
+        updateTriggers: { getFillColor: props.assessmentStyle?.key, getLineColor: props.assessmentStyle?.key },
+        lineWidthUnits: "pixels",
+        getLineWidth: 1,
+        pickable: true,
+      }),
+      new H3HexagonLayer<Project>({
+        id: "project-cells",
+        data: projects,
+        getHexagon: (p) => p.h3Id,
+        filled: true,
+        stroked: overlayOutlines,
+        extruded: false,
+        highPrecision: true,
+        getFillColor: (p) => [...typeColour(p.type), 60],
+        getLineColor: (p) => [...typeColour(p.type), 220],
+        lineWidthUnits: "pixels",
+        getLineWidth: 2,
+      }),
+      new H3HexagonLayer<string>({
+        id: "selected-cell",
+        data: selectedCell ? [selectedCell] : [],
+        getHexagon: (d) => d,
+        filled: true,
+        stroked: overlayOutlines,
+        extruded: false,
+        highPrecision: true,
+        getFillColor: [37, 99, 235, 40],
+        getLineColor: selectionLine,
+        lineWidthUnits: "pixels",
+        getLineWidth: 3,
+      }),
+      // Footprints as mapped in OSM. Extruded only by a tagged height; untagged stay flat.
+      new GeoJsonLayer<Facility["properties"]>({
+        id: "infra-footprints",
+        data: footprints as never,
+        filled: true,
+        stroked: true,
+        extruded: tilted,
+        getElevation: (f) => f.properties.heightM ?? 0,
+        getFillColor: (f) => [...facilityColour(f as Facility), f.id === selectedFacilityId ? 160 : 70],
+        getLineColor: (f) => [...facilityColour(f as Facility), f.geometry.type === "LineString" ? 210 : 255],
+        lineWidthUnits: "pixels",
+        getLineWidth: (f) =>
+          f.geometry.type === "LineString" ? (f.id === selectedFacilityId ? 5 : 1 + Math.min(2, (f.properties.voltageKv?.[0] ?? 0) / 200)) : 1.5,
+        lineCapRounded: true,
+        pickable: true,
+        updateTriggers: {
+          getFillColor: [colourTrigger, selectedFacilityId],
+          getLineColor: colourTrigger,
+          getLineWidth: selectedFacilityId,
+        },
+      }),
+      new LineLayer<Facility>({
+        id: "infra-stems",
+        data: tilted ? points : [],
+        getSourcePosition: (f) => [f.properties.lon, f.properties.lat, 0],
+        getTargetPosition: (f) => [f.properties.lon, f.properties.lat, tip],
+        getColor: (f) => [...facilityColour(f), 150],
+        getWidth: 1.5,
+        widthUnits: "pixels",
+        updateTriggers: { getColor: colourTrigger, getTargetPosition: tip },
+      }),
+      new ScatterplotLayer<Facility>({
+        id: "infra-points",
+        data: points,
+        getPosition: (f) => [f.properties.lon, f.properties.lat, tip],
+        getFillColor: (f) => [...facilityColour(f), 255],
+        getLineColor: (f) => (f.id === selectedFacilityId ? [255, 255, 255, 255] : [0, 0, 0, 255]),
+        // Plants scale with nameplate capacity (display only); every other site is a fixed dot.
+        getRadius: (f) =>
+          f.id === selectedFacilityId
+            ? 8
+            : f.properties.layer === "power_plants"
+              ? Math.min(9, 2 + Math.sqrt(f.properties.capacityMw ?? 0) / 6)
+              : f.properties.layer === "airports"
+                ? 3
+                : 4,
+        radiusUnits: "pixels",
+        radiusMinPixels: 3,
+        stroked: true,
+        lineWidthUnits: "pixels",
+        getLineWidth: (f) => (f.id === selectedFacilityId ? 2.5 : 1.5),
+        pickable: true,
+        updateTriggers: {
+          getPosition: tip,
+          getFillColor: colourTrigger,
+          getLineColor: selectedFacilityId,
+          getRadius: selectedFacilityId,
+          getLineWidth: selectedFacilityId,
+        },
+      }),
+      new TextLayer<Facility>({
+        id: "infra-labels",
+        data: labelled,
+        getPosition: (f) => [f.properties.lon, f.properties.lat, tip],
+        getText: (f) => facilityTitle(f.properties),
+        getColor: dark ? [216, 229, 247, 255] : [15, 23, 42, 255],
+        getSize: 12,
+        fontWeight: 600,
+        getPixelOffset: [0, -12],
+        getTextAnchor: "middle",
+        getAlignmentBaseline: "bottom",
+        characterSet: "auto",
+        fontFamily: "Inter, system-ui, sans-serif",
+        fontSettings: { sdf: true, fontSize: 64, buffer: 8 },
+        outlineWidth: 2,
+        outlineColor: dark ? [12, 24, 41, 245] : [255, 255, 255, 235],
+        updateTriggers: { getPosition: tip },
+      }),
+      new ScatterplotLayer<{ latitude: number; longitude: number; colour?: RGB }>({
+        id: "build-preview",
+        data: props.preview ? [props.preview] : [],
+        getPosition: (p) => [p.longitude, p.latitude],
+        getFillColor: (p) => [...(p.colour ?? [37, 99, 235]), 90],
+        getLineColor: selectionLine,
+        getRadius: 11,
+        radiusUnits: "pixels",
+        stroked: true,
+        lineWidthUnits: "pixels",
+        getLineWidth: 2.5,
+      }),
+    ];
+
+    overlay.setProps({
+      layers,
+      onClick: (info: PickingInfo) => {
+        if (!info.coordinate) return;
+        const [lng, lat] = info.coordinate;
+        let layerId = info.layer?.id;
+        let object = info.object;
+        // The grid covers every pixel, so it always wins a radius pick. Re-pick without it so a
+        // thin cable or power line a few pixels away still gets selected.
+        // Assessment cells are a display overlay: clicks fall through to what lies beneath.
+        const extra = propsRef.current.backgroundLayerIds ?? [];
+        const background = (id: string | undefined) => isBackgroundLayer(id, extra);
+        if (background(layerId) || !object) {
+          const alt = overlay.pickObject({
+            x: info.x,
+            y: info.y,
+            radius: 6,
+            layerIds: layers.map((l) => l.id).filter((id) => !background(id)),
+          });
+          if (alt?.object && alt.layer) {
+            layerId = alt.layer.id;
+            object = alt.object;
+          }
+        }
+        const picked = layerId && !background(layerId) && object ? { layerId, object } : null;
+        propsRef.current.onMapClick(lat, lng, picked);
+      },
+      getTooltip: ({ object, layer }: PickingInfo) => {
+        if (!object || !layer) return null;
+        if (layer.id === "timeline-impact") {
+          const c = object as ImpactCell;
+          const t = propsRef.current.timeline;
+          const value = (n: number | null) => n === null ? "Unknown" : `${n.toLocaleString(undefined, { maximumSignificantDigits: 4 })} ${t?.unit ?? "µg/m³"}`;
+          if (t?.medium !== "air") return { text: `${t?.pollutant} · ${timeLabel(t?.days ?? 0)}\n${t?.medium === "climate" ? "Source-cell contribution" : "Illustrative addition"}: ${value(c.added)}${t?.partial ? " (known sources only)" : ""}` };
+          if (t.measure === "exposure") return { text: `${t.pollutant} · ${timeLabel(t.days)}\nHistorical reference exposure (2024 held constant): ${value(c.baseline)}\nAccumulated added exposure: ${value(c.added)}${t.partial ? " (known sources only)" : ""}\nCombined exposure: ${value(c.baseline !== null && c.added !== null ? c.baseline + c.added : null)}` };
+          return { text: `${t?.pollutant} · ${timeLabel(t?.days ?? 0)}\nBaseline (2024): ${value(c.baseline)}\nIllustrative addition: ${value(c.added)}${t?.partial ? " (known sources only)" : ""}\nCombined: ${value(c.baseline !== null && c.added !== null ? c.baseline + c.added : null)}` };
+        }
+        if (layer.id === "projects") {
+          const p = object as Project;
+          return { text: `${p.name || typeLabel(p.type)}\n${typeLabel(p.type)}` };
+        }
+        if (layer.id === "assessment-cells") {
+          const c = object as CellState;
+          const style = propsRef.current.assessmentStyle;
+          return { text: style ? style.tooltip(c) : `${STATE_LABEL[c.state]}\nScreening result for this cell` };
+        }
+        if (layer.id === "infra-points" || layer.id === "infra-footprints") {
+          const p = (object as Facility).properties;
+          const company = p.operator ?? p.owner;
+          const metric = facilityMetric(p);
+          const lines = [facilityTitle(p), [p.kind ?? LAYER_META[p.layer].singular, company].filter(Boolean).join(" · ")];
+          if (metric !== null) {
+            lines.push(p.layer === "substations" || p.layer === "transmission_lines" ? formatKv(p.voltageKv ?? []) : formatKw(metric));
+          }
+          return { text: lines.join("\n") };
+        }
+        const context = propsRef.current.contextTooltip(layer.id, object);
+        if (context) return { text: context };
+        if (layer.id === "grid") {
+          const id = object as string;
+          const value = propsRef.current.cellTooltip(id);
+          return value ? { text: value } : null;
+        }
+        return null;
+      },
+    });
+  }, [
+    grid,
+    hoverCell,
+    labelled,
+    stemM,
+    props.projects,
+    props.selectedProjectId,
+    props.selectedCell,
+    props.facilities,
+    props.facilityColour,
+    props.selectedFacilityId,
+    props.tilted,
+    props.contextLayers,
+    props.timeline,
+    props.cellFill,
+    props.assessmentCells,
+    props.assessmentStyle,
+    props.preview,
+    props.theme,
+    props.hexOutlines,
+  ]);
+
+  // Preset drag-and-drop. HTML5 drag events bubble from the MapLibre and deck.gl canvases to the
+  // container; neither library handles them, so nothing is swallowed.
+  const dropHandlers = props.onDropPreset
+    ? {
+        onDragEnter: (e: DragEvent) => {
+          if (!isPresetDrag(e)) return;
+          e.preventDefault();
+          setDropping(true);
+        },
+        onDragOver: (e: DragEvent) => {
+          if (!isPresetDrag(e)) return;
+          e.preventDefault();
+          e.dataTransfer.dropEffect = "copy";
+          if (!dropping) setDropping(true);
+        },
+        onDragLeave: (e: DragEvent) => {
+          // Moving between the map's own child elements also fires dragleave.
+          const to = e.relatedTarget as Node | null;
+          if (to && containerRef.current?.contains(to)) return;
+          setDropping(false);
+        },
+        onDrop: (e: DragEvent) => {
+          setDropping(false);
+          if (!isPresetDrag(e)) return;
+          e.preventDefault();
+          const id = e.dataTransfer.getData(PRESET_DRAG_TYPE);
+          const map = mapRef.current;
+          const el = containerRef.current;
+          if (!id || !map || !el) return;
+          const rect = el.getBoundingClientRect();
+          const { lng, lat } = map.unproject([e.clientX - rect.left, e.clientY - rect.top]);
+          if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
+          propsRef.current.onDropPreset?.(id, Math.max(-90, Math.min(90, lat)), normaliseLongitude(lng));
+        },
+      }
+    : {};
+
+  // A drag cancelled with Escape or dropped elsewhere never reaches the map: clear the highlight.
+  useEffect(() => {
+    if (!dropping) return;
+    const clear = () => setDropping(false);
+    window.addEventListener("dragend", clear);
+    window.addEventListener("drop", clear);
+    return () => {
+      window.removeEventListener("dragend", clear);
+      window.removeEventListener("drop", clear);
+    };
+  }, [dropping]);
+
+  return (
+    <>
+      <div ref={containerRef} className={`map map-${props.body.id}`} {...dropHandlers} />
+      {dropping && (
+        <div className="map-drop" aria-hidden="true">
+          <span>Drop to preview here</span>
+        </div>
+      )}
+    </>
+  );
+}
